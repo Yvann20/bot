@@ -1,197 +1,222 @@
 import os
-from dotenv import load_dotenv
+import json
 import time
+import asyncio
+from pathlib import Path
 from datetime import datetime
+from dotenv import load_dotenv
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler, CallbackQueryHandler, ConversationHandler, MessageHandler, filters
+from telegram.ext import (
+    ApplicationBuilder,
+    ContextTypes,
+    CommandHandler,
+    CallbackQueryHandler,
+    ConversationHandler,
+    MessageHandler,
+    filters
+)
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
-import asyncio
 
-# Carregar variáveis de ambiente do arquivo .env
+# Configurações iniciais
 load_dotenv()
+CACHE_DIR = Path('cache')
+CACHE_DIR.mkdir(exist_ok=True)
+CACHE_TTL = 3600  # 1 hora em segundos
 
+# Variáveis de ambiente
 API_ID = os.getenv('API_ID')
 API_HASH = os.getenv('API_HASH')
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 YOUR_PHONE = os.getenv('YOUR_PHONE')
 
 if not all([API_ID, API_HASH, BOT_TOKEN, YOUR_PHONE]):
-    raise ValueError("Por favor, defina todas as variáveis de ambiente: API_ID, API_HASH, BOT_TOKEN, YOUR_PHONE.")
+    raise ValueError("Defina todas as variáveis de ambiente: API_ID, API_HASH, BOT_TOKEN, YOUR_PHONE.")
 
 client = TelegramClient('session_name', API_ID, API_HASH)
 
 # Estados da conversação
 LINK, INTERVAL, REFERRAL = range(3)
 
-# Armazenar as configurações
+# Configurações e controle
 settings = {
     'message_link': None,
     'referral_link': None,
     'user_id': None,
 }
 
-# Armazenar o job atual
-current_job = None
-
-# Estatísticas do bot
 statistics = {
     'messages_sent': 0,
     'active_campaigns': 0,
 }
 
-# Cache de participantes
-participants_cache = {}
+group_list = []
+active_campaigns = {}  # {user_id: {'job': job, 'start_time': timestamp}}
 
-# Variáveis globais para grupos e mensagens
-group_list = []  # Lista de grupos carregados
+# Função para verificar campanhas ativas
+def has_active_campaign(user_id):
+    return user_id in active_campaigns and active_campaigns[user_id]['job'] is not None
 
-# Autenticação para enviar mensagens
+# Autenticação
 async def authenticate():
     await client.start()
     if not await client.is_user_authorized():
         try:
             await client.send_code_request(YOUR_PHONE)
-            code = input('Digite o código recebido: ')
+            code = input('Código recebido: ')
             await client.sign_in(YOUR_PHONE, code)
         except SessionPasswordNeededError:
-            password = input('Digite sua senha: ')
-            await client.sign_in(YOUR_PHONE, password)
+            password = input('Senha: ')
+            await client.sign_in(password=password)
 
-# Função para obter participantes com cache
-async def get_participants(group):
-    if group.id not in participants_cache:
-        participants_cache[group.id] = await client.get_participants(group)
-    return participants_cache[group.id]
+# Cache de participantes em arquivo
+async def get_participant_ids(group):
+    cache_file = CACHE_DIR / f"{group.id}.json"
+    try:
+        if cache_file.exists():
+            file_mtime = cache_file.stat().st_mtime
+            if time.time() - file_mtime < CACHE_TTL:
+                with open(cache_file, 'r') as f:
+                    return set(json.load(f))
+    except Exception as e:
+        print(f"Erro ao ler cache: {e}")
 
-# Função para pré-carregar os grupos
+    try:
+        participants = await client.get_participants(group)
+        participant_ids = {p.id for p in participants}
+        with open(cache_file, 'w') as f:
+            json.dump(list(participant_ids), f)
+        return participant_ids
+    except Exception as e:
+        print(f"Erro ao atualizar cache: {e}")
+        return set()
+
+# Pré-carregar grupos
 async def preload_groups():
-    global group_list
     group_list.clear()
     async for dialog in client.iter_dialogs():
         if dialog.is_group and not dialog.archived:
             group_list.append(dialog.entity)
-    print(f"{len(group_list)} grupos pré-carregados.")
+    print(f"Grupos pré-carregados: {len(group_list)}")
 
-# Função para encaminhar a mensagem
+# Encaminhamento de mensagens
 async def forward_message_with_formatting(context: ContextTypes.DEFAULT_TYPE):
     start_time = time.time()
     try:
-        if settings['message_link'] is None:
-            print("Nenhum link de mensagem configurado para encaminhar.")
+        if not settings['message_link']:
             return
 
         parts = settings['message_link'].split('/')
-        chat = parts[-2]
-        message_id = int(parts[-1])
-
-        message = await client.get_messages(chat, ids=message_id)
+        message = await client.get_messages(parts[-2], ids=int(parts[-1]))
         me = await client.get_me()
         tasks = []
 
         for group in group_list:
-            participants = await get_participants(group)
-            if any(participant.id == me.id for participant in participants):
+            if me.id in await get_participant_ids(group):
                 tasks.append(client.forward_messages(group, message))
 
         if tasks:
             await asyncio.gather(*tasks)
             statistics['messages_sent'] += len(tasks)
-            print(f"{len(tasks)} mensagens encaminhadas.")
-        else:
-            print("Nenhuma mensagem foi encaminhada.")
+            print(f"Mensagens encaminhadas: {len (tasks)}")
+
     except Exception as e:
-        print(f"Erro ao encaminhar mensagem: {e}")
+        print(f"Erro no encaminhamento: {e}")
     finally:
-        end_time = time.time()
-        print(f"Duração total do job: {end_time - start_time:.2f} segundos")
+        print(f"Tempo de execução: {time.time() - start_time:.2f}s")
 
-# Função para iniciar a campanha
-async def start_campaign(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global current_job, statistics
+# Gestão de jobs
+def manage_jobs(job_queue, user_id, interval):
+    # Remove qualquer job existente para o usuário
+    if has_active_campaign(user_id):
+        active_campaigns[user_id]['job'].schedule_removal()
+        del active_campaigns[user_id]
 
-    if current_job is not None:
-        current_job.schedule_removal()
-        current_job = None
-        settings['message_link'] = None
-        statistics['active_campaigns'] -= 1
-        print("Campanha anterior cancelada.")
-
-    statistics['active_campaigns'] += 1
-    query = update.callback_query
-    await query.answer()
-    await query.message.edit_text('Envie o link da mensagem que deseja encaminhar:')
-    print("Esperando o link da mensagem.")
-
-    return LINK
-
-# Função para definir o link da mensagem
-async def set_message_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        print("Erro: update.message está None")
-        return ConversationHandler.END
-
-    print("Link recebido:", update.message.text)
-    settings['message_link'] = update.message.text
-    await update.message.reply_text(f"Link configurado: {settings['message_link']}\nAgora envie o intervalo em minutos:")
-    print("Esperando o intervalo.")
-
-    return INTERVAL
-
-# Função para definir o intervalo
-async def set_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not update.message:
-        print("Erro: update.message está None")
-        return ConversationHandler.END
-
-    print("Intervalo recebido:", update.message.text)
-
-    try:
-        interval = int(update.message.text)
-    except ValueError:
-        await update.message.reply_text("Por favor, insira um número válido.")
-        return INTERVAL
-
-    global current_job
-    if current_job is not None:
-        current_job.schedule_removal()
-
-    # Pré-carregar os grupos antes de iniciar o job
-    await preload_groups()
-
-    current_job = context.application.job_queue.run_repeating(
+    # Cria novo job
+    job = job_queue.run_repeating(
         forward_message_with_formatting,
         interval=interval * 60,
         first=0
     )
 
-    await update.message.reply_text(f"SUCESSO... CONFIGURADO {interval} MINUTOS")
-    print(f"Job de encaminhamento configurado para {interval} minutos.")
+    # Registra a campanha
+    active_campaigns[user_id] = {
+        'job': job,
+        'start_time': time.time(),
+        'interval': interval
+    }
 
+    statistics['active_campaigns'] = len(active_campaigns)
+
+# Função para limpar jobs finalizados
+async def cleanup_jobs(context: ContextTypes.DEFAULT_TYPE):
+    now = time.time()
+    expired_users = [
+        user_id for user_id, data in active_campaigns.items()
+        if now - data['start_time'] > (data['interval'] * 60 * 10)  # 10 ciclos
+    ]
+
+    for user_id in expired_users:
+        active_campaigns[user_id]['job'].schedule_removal()
+        del active_campaigns[user_id]
+
+    if expired_users:
+        statistics['active_campaigns'] = len(active_campaigns)
+        print(f"Limpeza automática: {len(expired_users)} campanhas expiradas removidas")
+
+# Handlers do Telegram
+async def start_campaign(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if has_active_campaign(user_id):
+        await update.callback_query.answer()
+        await update.callback_query.edit_message_text(
+            "⚠️ Você já tem uma campanha ativa! Cancele a atual antes de iniciar uma nova.",
+            show_alert=True
+        )
+        return ConversationHandler.END
+
+    await update.callback_query.answer()
+    await update.callback_query.edit_message_text('Envie o link da mensagem:')
+    return LINK
+
+async def set_message_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    settings['message_link'] = update.message.text
+    await update.message.reply_text("Link salvo! Agora envie o intervalo em minutos:")
+    return INTERVAL
+
+async def set_interval(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        interval = int(update.message.text)
+        user_id = update.effective_user.id
+        await preload_groups()
+        manage_jobs(context.application.job_queue, user_id, interval)
+        await update.message.reply_text(f"✅ Campanha iniciada com intervalo de {interval} minutos")
+    except ValueError:
+        await update.message.reply_text("⚠️ Formato inválido! Use números inteiros.")
+        return INTERVAL
     return ConversationHandler.END
 
-# Função para cancelar o encaminhamento da campanha
 async def cancel_campaign(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global current_job, statistics
-    if current_job is not None:
-        current_job.schedule_removal()
-        current_job = None
-        settings['message_link'] = None
-        statistics['active_campaigns'] -= 1
-        await update.callback_query.answer()
-        await update.callback_query.message.edit_text("Encaminhamento de mensagens cancelado.")
-        print("Encaminhamento de mensagens cancelado.")
-    else:
-        await update.callback_query.answer()
-        await update.callback_query.message.edit_text("Nenhuma campanha ativa para cancelar.")
-        print("Nenhuma campanha ativa para cancelar.")
+    user_id = update.effective_user.id
 
-# Função para cancelar a conversação
+    if not has_active_campaign(user_id):
+        await update.callback_query.answer()
+        await update.callback_query.message.edit_text("❌ Nenhuma campanha ativa para cancelar.")
+        return
+
+    # Remove o job e limpa os dados
+    active_campaigns[user_id]['job'].schedule_removal()
+    del active_campaigns[user_id]
+
+    statistics['active_campaigns'] = len(active_campaigns)
+    await update.callback_query.answer()
+    await update.callback_query.message.edit_text("✅ Campanha cancelada com sucesso!")
+
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Operação cancelada.")
     return ConversationHandler.END
 
-# Função para responder ao comando /start
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     now = datetime.now()
@@ -217,7 +242,6 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         print(f"Erro ao enviar mensagem: {e}")
         await update.message.reply_text("Desculpe, ocorreu um erro ao tentar enviar a mensagem.")
 
-# Função para exibir estatísticas do bot
 async def show_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     stats_message = (
@@ -227,14 +251,12 @@ async def show_statistics(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
     await update.callback_query.message.reply_text(stats_message)
 
-# Função para definir o link de referência
 async def set_referral_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.answer()
     user_id = update.callback_query.from_user.id
     settings['referral_link'] = f"https://t.me/MEIA_GIL_BOT?start=ref_{user_id}"
     await update.callback_query.message.reply_text(f"Seu link de referência: {settings['referral_link']}")
 
-# Função principal para configurar o bot
 def main():
     loop = asyncio.get_event_loop()
 
