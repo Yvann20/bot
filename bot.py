@@ -4,17 +4,17 @@ import time
 import asyncio
 from pathlib import Path
 from datetime import datetime
-from dotenv import load_dotenv
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from dotenv import load_dotenv                                        
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup   
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
-    CommandHandler,
-    CallbackQueryHandler,
+    CommandHandler,                                                      
+CallbackQueryHandler,
     ConversationHandler,
     MessageHandler,
     filters
-)
+)                                                                       
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
 
@@ -39,8 +39,7 @@ client = TelegramClient('session_name', API_ID, API_HASH)
 LINK, INTERVAL, REFERRAL = range(3)
 
 # Configurações e controle
-settings = {
-    'message_link': None,
+settings = {                                                                    'message_link': None,
     'referral_link': None,
     'user_id': None,
 }
