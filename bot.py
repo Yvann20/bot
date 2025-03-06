@@ -4,31 +4,33 @@ import time
 import asyncio
 from pathlib import Path
 from datetime import datetime
-from dotenv import load_dotenv                                        
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup   
+from dotenv import load_dotenv
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     ApplicationBuilder,
     ContextTypes,
-    CommandHandler,                                                      
-CallbackQueryHandler,
+    CommandHandler,
+    CallbackQueryHandler,
     ConversationHandler,
     MessageHandler,
     filters
-)                                                                       
+)
 from telethon import TelegramClient
 from telethon.errors import SessionPasswordNeededError
+from prometheus_client import start_http_server, Counter
 
 # Configurações iniciais
 load_dotenv()
 CACHE_DIR = Path('cache')
 CACHE_DIR.mkdir(exist_ok=True)
 CACHE_TTL = 3600  # 1 hora em segundos
+FEEDBACK_FILE = 'feedback.json'
 
 # Variáveis de ambiente
-API_ID = os.getenv('API_ID')
-API_HASH = os.getenv('API_HASH')
-BOT_TOKEN = os.getenv('BOT_TOKEN')
-YOUR_PHONE = os.getenv('YOUR_PHONE')
+API_ID = os.environ.get('API_ID')
+API_HASH = os.environ.get('API_HASH')
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+YOUR_PHONE = os.environ.get('YOUR_PHONE')
 
 if not all([API_ID, API_HASH, BOT_TOKEN, YOUR_PHONE]):
     raise ValueError("Defina todas as variáveis de ambiente: API_ID, API_HASH, BOT_TOKEN, YOUR_PHONE.")
@@ -36,10 +38,11 @@ if not all([API_ID, API_HASH, BOT_TOKEN, YOUR_PHONE]):
 client = TelegramClient('session_name', API_ID, API_HASH)
 
 # Estados da conversação
-LINK, INTERVAL, REFERRAL = range(3)
+LINK, INTERVAL, FEEDBACK = range(3)
 
 # Configurações e controle
-settings = {                                                                    'message_link': None,
+settings = {
+    'message_link': None,
     'referral_link': None,
     'user_id': None,
 }
@@ -52,21 +55,25 @@ statistics = {
 group_list = []
 active_campaigns = {}  # {user_id: {'job': job, 'start_time': timestamp}}
 
+# Contadores para monitoramento
+messages_sent_counter = Counter('messages_sent', 'Total de mensagens enviadas')
+active_campaigns_counter = Counter('active_campaigns', 'Total de campanhas ativas')
+
 # Função para verificar campanhas ativas
 def has_active_campaign(user_id):
     return user_id in active_campaigns and active_campaigns[user_id]['job'] is not None
 
 # Autenticação
 async def authenticate():
-    await client.start()
-    if not await client.is_user_authorized():
-        try:
-            await client.send_code_request(YOUR_PHONE)
-            code = input('Código recebido: ')
-            await client.sign_in(YOUR_PHONE, code)
-        except SessionPasswordNeededError:
-            password = input('Senha: ')
-            await client.sign_in(password=password)
+    async with client:
+        if not await client.is_user_authorized():
+            try:
+                await client.send_code_request(YOUR_PHONE)
+                code = input('Código recebido: ')
+                await client.sign_in(YOUR_PHONE, code)
+            except SessionPasswordNeededError:
+                password = input('Senha: ')
+                await client.sign_in(password=password)
 
 # Cache de participantes em arquivo
 async def get_participant_ids(group):
@@ -117,7 +124,8 @@ async def forward_message_with_formatting(context: ContextTypes.DEFAULT_TYPE):
         if tasks:
             await asyncio.gather(*tasks)
             statistics['messages_sent'] += len(tasks)
-            print(f"Mensagens encaminhadas: {len (tasks)}")
+            messages_sent_counter.inc(len(tasks))
+            print(f"Mensagens encaminhadas: {len(tasks)}")
 
     except Exception as e:
         print(f"Erro no encaminhamento: {e}")
@@ -126,19 +134,16 @@ async def forward_message_with_formatting(context: ContextTypes.DEFAULT_TYPE):
 
 # Gestão de jobs
 def manage_jobs(job_queue, user_id, interval):
-    # Remove qualquer job existente para o usuário
     if has_active_campaign(user_id):
         active_campaigns[user_id]['job'].schedule_removal()
         del active_campaigns[user_id]
 
-    # Cria novo job
     job = job_queue.run_repeating(
         forward_message_with_formatting,
         interval=interval * 60,
         first=0
     )
 
-    # Registra a campanha
     active_campaigns[user_id] = {
         'job': job,
         'start_time': time.time(),
@@ -146,6 +151,7 @@ def manage_jobs(job_queue, user_id, interval):
     }
 
     statistics['active_campaigns'] = len(active_campaigns)
+    active_campaigns_counter.inc()
 
 # Função para limpar jobs finalizados
 async def cleanup_jobs(context: ContextTypes.DEFAULT_TYPE):
@@ -162,6 +168,18 @@ async def cleanup_jobs(context: ContextTypes.DEFAULT_TYPE):
     if expired_users:
         statistics['active_campaigns'] = len(active_campaigns)
         print(f"Limpeza automática: {len(expired_users)} campanhas expiradas removidas")
+
+# Função para coletar feedback
+async def collect_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Por favor, envie seu feedback:")
+    return FEEDBACK
+
+async def save_feedback(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    feedback = update.message.text
+    with open(FEEDBACK_FILE, 'a') as f:
+        f.write(f"{datetime.now()}: {feedback}\n")
+    await update.message.reply_text("✅ Seu feedback foi recebido, obrigado!")
+    return ConversationHandler.END
 
 # Handlers do Telegram
 async def start_campaign(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -204,11 +222,11 @@ async def cancel_campaign(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.callback_query.message.edit_text("❌ Nenhuma campanha ativa para cancelar.")
         return
 
-    # Remove o job e limpa os dados
     active_campaigns[user_id]['job'].schedule_removal()
     del active_campaigns[user_id]
 
     statistics['active_campaigns'] = len(active_campaigns)
+    active_campaigns_counter.dec()
     await update.callback_query.answer()
     await update.callback_query.message.edit_text("✅ Campanha cancelada com sucesso!")
 
@@ -229,8 +247,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     keyboard = [
         [InlineKeyboardButton("🚀 INICIAR UMA NOVA CAMPANHA 🚀", callback_data='create_campaign')],
         [InlineKeyboardButton("🛑 CANCELAR CAMPANHA 🛑", callback_data='cancel_campaign')],
-        [InlineKeyboardButton("📊 VER ESTATÍSTICAS DO BOT 📊", callback_data='statistics')],
+        [ InlineKeyboardButton("📊 VER ESTATÍSTICAS DO BOT 📊", callback_data='statistics')],
         [InlineKeyboardButton("LINK DE REFERÊNCIA", callback_data='referral')],
+        [InlineKeyboardButton("💬 ENVIAR FEEDBACK 💬", callback_data='send_feedback')],
     ]
 
     reply_markup = InlineKeyboardMarkup(keyboard)
@@ -257,6 +276,7 @@ async def set_referral_link(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.callback_query.message.reply_text(f"Seu link de referência: {settings['referral_link']}")
 
 def main():
+    start_http_server(8000)  # Inicia o servidor de métricas
     loop = asyncio.get_event_loop()
 
     try:
@@ -270,6 +290,7 @@ def main():
             states={
                 LINK: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_message_link)],
                 INTERVAL: [MessageHandler(filters.TEXT & ~filters.COMMAND, set_interval)],
+                FEEDBACK: [MessageHandler(filters.TEXT & ~filters.COMMAND, save_feedback)],
             },
             fallbacks=[CommandHandler('cancel', cancel)],
         )
@@ -278,6 +299,7 @@ def main():
         application.add_handler(CallbackQueryHandler(show_statistics, pattern='statistics'))
         application.add_handler(CallbackQueryHandler(set_referral_link, pattern='referral'))
         application.add_handler(CallbackQueryHandler(cancel_campaign, pattern='cancel_campaign'))
+        application.add_handler(CallbackQueryHandler(collect_feedback, pattern='send_feedback'))
         application.add_handler(campaign_handler)
 
         application.run_polling()
