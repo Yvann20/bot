@@ -1,0 +1,931 @@
+import asyncio
+import os
+import random
+import sqlite3
+import re
+import shutil
+import sys
+from datetime import datetime, timedelta
+from dotenv import load_dotenv
+from telethon import TelegramClient, events, Button
+from flask import Flask, render_template_string, request, redirect, url_for, session, jsonify, send_file
+from flask_socketio import SocketIO, emit
+from flask_limiter import Limiter
+from flask_limiter.util import get_remote_address
+import pyotp
+import traceback
+import requests
+import qrcode
+import base64
+from io import BytesIO
+
+# --- CONFIGS E VARIÁVEIS GLOBAIS ---
+load_dotenv()
+api_id = int(os.getenv('API_ID'))
+api_hash = os.getenv('API_HASH')
+bot_token = os.getenv('BOT_TOKEN')
+admin_user_ids = [int(x.strip()) for x in os.getenv('ADMIN_USER_IDS', '').split(',') if x.strip().isdigit()]
+
+DB_NAME = "encaminhados.db"
+LOG_FILE = "log.txt"
+CHANNELS_FILE = "channels.ini"
+BACKUP_DIR = "backups"
+PAINEL_SENHA = os.getenv("PAINEL_SENHA") or "123456"
+
+PAINEL_2FA_SECRET = os.getenv("PAINEL_2FA_SECRET") or pyotp.random_base32()
+WEBHOOK_URL = os.getenv("WEBHOOK_URL")
+BLACKLIST = set()  # Carrega do BD
+BAN_LIST = set()  # IPs banidos temporários
+
+if not os.path.exists(BACKUP_DIR):
+    os.makedirs(BACKUP_DIR)
+
+# --- EVENT LOOP ---
+if sys.version_info >= (3, 10):
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+else:
+    loop = asyncio.get_event_loop()
+
+user_client = TelegramClient('user_session', api_id, api_hash, loop=loop)
+bot = TelegramClient('bot_session', api_id, api_hash, loop=loop)
+
+# --- VARIÁVEIS DE CONTROLE ---
+enviando = False
+enviados = 0
+erros = 0
+auto_mode = False
+auto_paused = False
+waiting_for_channel = None
+waiting_for_search = False
+agendamento = None  # (datetime, tipo) ou None
+limite_hora = 30  # Limite de vídeos por hora
+limite_dia = 200  # Limite de vídeos por dia
+contagem_hora = 0
+contagem_dia = 0
+hora_atual = datetime.now().hour
+dia_atual = datetime.now().day
+simulacao = False
+
+# --- FUNÇÕES DE UTILIDADE ---
+def log(text):
+    now = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+    with open(LOG_FILE, "a") as f:
+        f.write(f"[{now}] {text}\n")
+    print(f"[{now}] {text}")
+
+def save_channels(origin, dest):
+    with open(CHANNELS_FILE, "w") as f:
+        f.write(f"{origin}\n{dest}\n")
+
+def load_channels():
+    if os.path.exists(CHANNELS_FILE):
+        with open(CHANNELS_FILE) as f:
+            lines = f.read().splitlines()
+            if len(lines) >= 2:
+                return lines[0], lines[1]
+    return "", ""
+
+source_channel, dest_channel = load_channels()
+
+def set_source_channel(ch):
+    global source_channel
+    source_channel = ch
+    save_channels(source_channel, dest_channel)
+
+def set_dest_channel(ch):
+    global dest_channel
+    dest_channel = ch
+    save_channels(source_channel, dest_channel)
+
+def sanitize_channel(text):
+    text = text.strip()
+    m = re.match(r'(https?://)?t\.me/([a-zA-Z0-9_]+)', text)
+    if m:
+        return '@' + m.group(2)
+    if text.startswith('@'):
+        return text
+    return '@' + text.lstrip('@/')
+
+def init_db():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''CREATE TABLE IF NOT EXISTS enviados (message_id INTEGER PRIMARY KEY)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS audit_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        admin TEXT, ip TEXT, acao TEXT, status TEXT,
+        datahora DATETIME DEFAULT CURRENT_TIMESTAMP)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS blacklist (
+        palavra TEXT PRIMARY KEY)''')
+    cursor.execute('''CREATE TABLE IF NOT EXISTS erros (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, 
+        datahora DATETIME DEFAULT CURRENT_TIMESTAMP,
+        error_text TEXT, traceback TEXT
+    )''')
+    conn.commit()
+    conn.close()
+    load_blacklist()
+
+def log_auditoria(admin, ip, acao, status):
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO audit_log (admin, ip, acao, status) VALUES (?, ?, ?, ?)",
+                       (admin, ip, acao, status))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log(f"Erro ao registrar auditoria: {e}")
+
+def blacklisted(texto):
+    texto = (texto or "").lower()
+    for palavra in BLACKLIST:
+        if palavra in texto:
+            return True
+    return False
+
+def add_blacklist(palavra):
+    palavra = palavra.lower().strip()
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO blacklist (palavra) VALUES (?)", (palavra,))
+    conn.commit()
+    conn.close()
+    BLACKLIST.add(palavra)
+
+def remove_blacklist(palavra):
+    palavra = palavra.lower().strip()
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM blacklist WHERE palavra = ?", (palavra,))
+    conn.commit()
+    conn.close()
+    BLACKLIST.discard(palavra)
+
+def load_blacklist():
+    global BLACKLIST
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT palavra FROM blacklist")
+    BLACKLIST = set([row[0] for row in cursor.fetchall()])
+    conn.close()
+
+def save_erro(error_text, tb):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO erros (error_text, traceback) VALUES (?, ?)", (error_text, tb))
+    conn.commit()
+    conn.close()
+
+def notificar_webhook(msg):
+    if WEBHOOK_URL:
+        try:
+            requests.post(WEBHOOK_URL, json={"text": msg})
+        except Exception as e:
+            log(f"Falha webhook: {e}")
+
+def is_real_video(msg):
+    # Se o vídeo tem texto e não cai na blacklist, é real.
+    return (
+        msg.video and
+        msg.media and
+        hasattr(msg.media, 'document') and
+        not getattr(msg, 'sticker', False) and
+        not getattr(msg, 'gif', False) and
+        not blacklisted(getattr(msg, 'text', ''))
+    )
+
+def is_source_channel(event):
+    ch_username = getattr(event.chat, 'username', None)
+    if ch_username and ("@" + ch_username == source_channel):
+        return True
+    if not ch_username and str(event.chat_id) == source_channel.lstrip("@"):
+        return True
+    return False
+
+def backup_db():
+    today = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    backup_name = os.path.join(BACKUP_DIR, f"encaminhados_{today}.db")
+    shutil.copy2(DB_NAME, backup_name)
+    backups = sorted([f for f in os.listdir(BACKUP_DIR) if f.endswith(".db")])
+    if len(backups) > 10:
+        os.remove(os.path.join(BACKUP_DIR, backups[0]))
+
+def reset_contadores():
+    global contagem_hora, contagem_dia, hora_atual, dia_atual
+    now = datetime.now()
+    if now.hour != hora_atual:
+        contagem_hora = 0
+        hora_atual = now.hour
+    if now.day != dia_atual:
+        contagem_dia = 0
+        dia_atual = now.day
+
+# --- PAINEL FLASK ---
+app = Flask(__name__)
+app.secret_key = "painel_superbot"
+socketio = SocketIO(app, async_mode='threading')
+limiter = Limiter(
+    get_remote_address,
+    app=app,
+    default_limits=["5 per minute"]
+)
+
+def is_admin(user_id):
+    return user_id in admin_user_ids
+
+def get_status_dict():
+    return {
+        "origem": source_channel,
+        "destino": dest_channel,
+        "auto_mode": auto_mode,
+        "auto_paused": auto_paused,
+        "enviando": enviando,
+        "enviados": enviados,
+        "erros": erros,
+        "admins": admin_user_ids,
+        "agendamento": agendamento.strftime('%Y-%m-%d %H:%M') if agendamento else None,
+        "limite_hora": limite_hora,
+        "limite_dia": limite_dia,
+        "contagem_hora": contagem_hora,
+        "contagem_dia": contagem_dia,
+        "uptime": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        "modo_simulacao": simulacao,
+        "blacklist": ", ".join(BLACKLIST)
+    }
+
+# --- LOGIN 2FA ---
+@app.route('/qrcode')
+def qrcode_img():
+    totp = pyotp.TOTP(PAINEL_2FA_SECRET)
+    uri = totp.provisioning_uri(name="PainelSuperBot", issuer_name="SuperBot")
+    img = qrcode.make(uri)
+    buf = BytesIO()
+    img.save(buf, format='PNG')
+    buf.seek(0)
+    return send_file(buf, mimetype='image/png')
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    erro = ""
+    if request.method == 'POST':
+        senha = request.form.get('senha')
+        totp_code = request.form.get('totp')
+        if BAN_LIST and request.remote_addr in BAN_LIST:
+            erro = "Você foi banido temporariamente. Tente novamente mais tarde."
+            log_auditoria("painel", request.remote_addr, "login_ban", "fail")
+        elif senha == PAINEL_SENHA:
+            totp = pyotp.TOTP(PAINEL_2FA_SECRET)
+            if totp.verify(totp_code):
+                session['logado'] = True
+                log_auditoria("painel", request.remote_addr, "login", "sucesso")
+                return redirect(url_for('painel'))
+            else:
+                erro = "Código 2FA inválido!"
+                log_auditoria("painel", request.remote_addr, "login", "2fa_invalido")
+                registrar_ban(request.remote_addr)
+        else:
+            erro = "Senha incorreta!"
+            log_auditoria("painel", request.remote_addr, "login", "senha_incorreta")
+            registrar_ban(request.remote_addr)
+    return f'''
+    <form method="post" style="max-width:280px;margin:auto;padding:40px;">
+        <h2>Painel do SuperBot</h2>
+        <input type="password" name="senha" placeholder="Senha do painel"><br>
+        <input type="text" name="totp" placeholder="Código 2FA"><br>
+        <button type="submit">Entrar</button>
+        <br><span style="color:red;">{erro}</span>
+        <br><img src="/qrcode" width="140"/>
+        <div><small>Abra o Google Authenticator e cadastre esse QRCode para receber o código 2FA.</small></div>
+    </form>
+    '''
+
+def registrar_ban(ip):
+    # Muito erro? ban temporário de 3 minutos
+    if ip not in BAN_LIST:
+        BAN_LIST.add(ip)
+        loop.call_later(180, lambda: BAN_LIST.discard(ip))
+
+@app.route('/logout')
+def logout():
+    session['logado'] = False
+    return redirect(url_for('login'))
+
+@app.route('/', methods=['GET', 'POST'])
+def painel():
+    if not session.get('logado'):
+        return redirect(url_for('login'))
+    status = get_status_dict()
+    logs = []
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE) as f:
+            logs = f.readlines()[-30:]
+    erro_recentes = []
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT datahora,error_text FROM erros ORDER BY id DESC LIMIT 5")
+    erro_recentes = cursor.fetchall()
+    conn.close()
+    return render_template_string(PAINEL_HTML, status=status, logs=logs, erros=erro_recentes)
+
+# --- Rate limit + log auditoria nas ações ---
+@app.route('/comando', methods=['POST'])
+@limiter.limit("10/minute")
+def comando():
+    if not session.get('logado'):
+        return "Não autorizado", 403
+    cmd = request.form.get('cmd')
+    valor = request.form.get('valor', '')
+    global auto_mode, auto_paused, enviando, agendamento, limite_hora, limite_dia, simulacao
+    log_auditoria("painel", request.remote_addr, cmd, "executado")
+
+    try:
+        # Comandos do painel:
+        if cmd == "iniciar_manual":
+            simulacao = False
+            asyncio.run_coroutine_threadsafe(encaminhar_videos_web(), loop)
+        elif cmd == "parar_manual":
+            global enviando
+            enviando = False
+        elif cmd == "auto_on":
+            auto_mode = True
+            auto_paused = False
+        elif cmd == "auto_off":
+            auto_mode = False
+        elif cmd == "pause_auto":
+            auto_paused = True
+        elif cmd == "resume_auto":
+            auto_paused = False
+        elif cmd == "limpar_ids":
+            limpar_ids()
+        elif cmd == "backup":
+            backup_db()
+        elif cmd == "set_origem":
+            set_source_channel(sanitize_channel(valor))
+        elif cmd == "set_destino":
+            set_dest_channel(sanitize_channel(valor))
+        elif cmd == "set_limite_hora":
+            try:
+                limite_hora = int(valor)
+            except:
+                pass
+        elif cmd == "set_limite_dia":
+            try:
+                limite_dia = int(valor)
+            except:
+                pass
+        elif cmd == "agendar":
+            try:
+                agendamento = datetime.strptime(valor, "%Y-%m-%d %H:%M")
+            except:
+                agendamento = None
+        elif cmd == "cancelar_agendamento":
+            agendamento = None
+        elif cmd == "add_admin":
+            try:
+                admin_user_ids.append(int(valor))
+            except:
+                pass
+        elif cmd == "rem_admin":
+            try:
+                admin_user_ids.remove(int(valor))
+            except:
+                pass
+        elif cmd == "ativar_simulacao":
+            simulacao = True
+        elif cmd == "desativar_simulacao":
+            simulacao = False
+        elif cmd == "add_blacklist":
+            add_blacklist(valor)
+        elif cmd == "rem_blacklist":
+            remove_blacklist(valor)
+        elif cmd == "comando_shell":
+            resultado = os.popen(valor).read()
+            log_auditoria("painel", request.remote_addr, f"shell:{valor}", "ok")
+            notificar_webhook(f"Shell foi executado: {valor}\nResultado:\n{resultado[:500]}")
+            return f"<pre>{resultado}</pre><a href='/'>Voltar</a>"
+        elif cmd == "deploy_restart":
+            notificar_webhook("Painel pediu restart do processo!")
+            log("Reiniciando via painel por demanda!")
+            import threading
+            threading.Thread(target=lambda:os.execv(sys.executable, ['python'] + sys.argv)).start()
+            return "<b>O painel está reiniciando... Aguarde uns segundos</b><br><a href='/'>Voltar</a>"
+        else:
+            pass
+    except Exception as e:
+        log(f"❌ Erro comando painel {cmd}: {e}")
+        save_erro(str(e), traceback.format_exc())
+        notificar_webhook(f"Erro gravíssimo: {traceback.format_exc()}")
+        emit("erro", {"msg":str(e)}, broadcast=True)
+    return redirect(url_for('painel'))
+
+# ... CONTINUAÇÃO ABAIXO ...
+
+@app.route('/buscar', methods=['POST'])
+@limiter.limit("5/minute")
+def buscar():
+    if not session.get('logado'):
+        return "Não autorizado", 403
+    termo = request.form.get('termo')
+    async def busca():
+        messages = await user_client.get_messages(source_channel, limit=500)
+        results = [
+            msg for msg in messages if is_real_video(msg) and msg.text and termo.lower() in msg.text.lower()
+        ]
+        return results
+    fut = asyncio.run_coroutine_threadsafe(busca(), loop)
+    try:
+        results = fut.result(timeout=30)
+        txt = "<br>".join(
+            f"ID: {msg.id} | {msg.text[:40]}" for msg in results[:10]
+        )
+    except Exception as e:
+        txt = f"Erro: {e}"
+    return f"<h3>Resultados:</h3>{txt or 'Nenhum encontrado.'}<br><a href='/'>Voltar</a>"
+
+@app.route('/thumb/<msgid>')
+def thumb(msgid):
+    async def load_thumb():
+        msg = await user_client.get_messages(source_channel, ids=int(msgid))
+        if hasattr(msg, 'photo') or (hasattr(msg, "video") and msg.video):
+            img_path = f"cache/thumb_{msgid}.jpg"
+            await msg.download_media(file=img_path, thumb=-1)
+            return img_path
+        return None
+    fut = asyncio.run_coroutine_threadsafe(load_thumb(), loop)
+    path = fut.result(timeout=20)
+    if path and os.path.exists(path):
+        return send_file(path, mimetype="image/jpeg")
+    return "Sem thumb", 404
+
+# Fórmula HTML PAINEL melhorada: inclui simulação, blacklist etc.
+PAINEL_HTML = """
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Painel SuperBot</title>
+    <style>
+        body { font-family: Arial; background: #222; color: #eee; }
+        .painel { max-width: 900px; margin: auto; background: #333; padding: 20px; border-radius: 10px; }
+        h2 { color: #0f0; }
+        input, button { padding: 5px; margin: 2px; }
+        .logs { background: #111; color: #0f0; padding: 10px; height: 180px; overflow-y: scroll; font-size: 12px; }
+        .status { background: #222; padding: 10px; border-radius: 5px; }
+        .erros { background: #900; color: #fff; padding: 5px; margin: 5px 0; font-size: 12px; border-radius: 4px; }
+        .linha { margin-bottom: 10px; }
+        .thumblist img { max-width: 70px; max-height: 70px; margin:3px;border-radius:6px;}
+    </style>
+    <script src="//cdnjs.cloudflare.com/ajax/libs/socket.io/4.5.4/socket.io.min.js"></script>
+    <script>
+        const socket = io();
+        socket.on("erro", function(data) {
+            alert("!!! ERRO CRÍTICO: " + (data && data.msg ? data.msg : ""));
+            let beep = new Audio("https://cdn.pixabay.com/audio/2022/12/19/audio_12fbfa7c42.mp3");
+            beep.play();
+        });
+    </script>
+</head>
+<body>
+<div class="painel">
+    <h2>SuperBot Painel</h2>
+    <div class="status">
+        <b>Origem:</b> {{status['origem']}}<br>
+        <b>Destino:</b> {{status['destino']}}<br>
+        <b>Auto-Encaminhar:</b> {{'ATIVO' if status['auto_mode'] else 'DESATIVADO'}}<br>
+        <b>Pausado:</b> {{'SIM' if status['auto_paused'] else 'NÃO'}}<br>
+        <b>Enviando Manual:</b> {{'SIM' if status['enviando'] else 'NÃO'}}<br>
+        <b>Simulação:</b> {{'SIM' if status['modo_simulacao'] else 'NÃO'}}<br>
+        <b>Enviados:</b> {{status['enviados']}} | <b>Erros:</b> {{status['erros']}}<br>
+        <b>Admins:</b> {{status['admins']}}<br>
+        <b>Blacklist:</b> {{status['blacklist']}}<br>
+        <b>Agendamento:</b> {{status['agendamento'] or 'Nenhum'}}<br>
+        <b>Limite/hora:</b> {{status['limite_hora']}} | <b>Limite/dia:</b> {{status['limite_dia']}}<br>
+        <b>Contagem/hora:</b> {{status['contagem_hora']}} | <b>Contagem/dia:</b> {{status['contagem_dia']}}<br>
+        <b>Uptime:</b> {{status['uptime']}}
+    </div>
+    <form method="post" action="/comando">
+        <div class="linha">
+            <button name="cmd" value="iniciar_manual">▶️ Iniciar Manual</button>
+            <button name="cmd" value="parar_manual">⏹️ Parar Manual</button>
+            <button name="cmd" value="auto_on">🔄 Auto-Encaminhar</button>
+            <button name="cmd" value="auto_off">⏹️ Parar Auto</button>
+            <button name="cmd" value="pause_auto">⏸️ Pausar Auto</button>
+            <button name="cmd" value="resume_auto">▶️ Retomar Auto</button>
+        </div>
+        <div class="linha">
+            <input name="valor" placeholder="@canal de origem"><button name="cmd" value="set_origem">Definir Origem</button>
+            <input name="valor" placeholder="@canal de destino"><button name="cmd" value="set_destino">Definir Destino</button>
+        </div>
+        <div class="linha">
+            <input name="valor" placeholder="Limite/hora" type="number"><button name="cmd" value="set_limite_hora">Limite/hora</button>
+            <input name="valor" placeholder="Limite/dia" type="number"><button name="cmd" value="set_limite_dia">Limite/dia</button>
+        </div>
+        <div class="linha">
+            <input name="valor" placeholder="YYYY-MM-DD HH:MM"><button name="cmd" value="agendar">Agendar</button>
+            <button name="cmd" value="cancelar_agendamento">Cancelar Agendamento</button>
+        </div>
+        <div class="linha">
+            <button name="cmd" value="limpar_ids">🗑️ Limpar IDs</button>
+            <button name="cmd" value="backup">💾 Backup</button>
+            <button name="cmd" value="deploy_restart">🔁 Reiniciar/Deploy</button>
+        </div>
+        <div class="linha">
+            <input name="valor" placeholder="ID admin"><button name="cmd" value="add_admin">Adicionar Admin</button>
+            <input name="valor" placeholder="ID admin"><button name="cmd" value="rem_admin">Remover Admin</button>
+        </div>
+        <div class="linha">
+            <button name="cmd" value="ativar_simulacao">🧪 Ativar Simulação</button>
+            <button name="cmd" value="desativar_simulacao">Desativar Simulação</button>
+        </div>
+        <div class="linha">
+            <input name="valor" placeholder="Nova palavra blacklist"><button name="cmd" value="add_blacklist">➕ Blacklist</button>
+            <input name="valor" placeholder="Remover palavra"><button name="cmd" value="rem_blacklist">➖ Blacklist</button>
+        </div>
+        <div class="linha">
+            <input name="valor" style="width:260px" placeholder="comando shell ex: uptime"><button name="cmd" value="comando_shell">Executar Shell</button>
+        </div>
+    </form>
+    <form method="post" action="/buscar">
+        <input name="termo" placeholder="Buscar vídeo por nome">
+        <button type="submit">🔍 Buscar</button>
+    </form>
+    <div class="thumblist">
+        <!-- Exemplo de thumbs (para novidade futura/integração!) -->
+    </div>
+    <div class="logs">
+        <b>Logs recentes:</b><br>
+        {% for l in logs %}
+            {{l}}<br>
+        {% endfor %}
+    </div>
+    <div class="erros">
+        <b>Últimos Erros Críticos:</b><br>
+        {% for dt,msg in erros %}
+            {{dt}} - {{msg}}<br>
+        {% endfor %}
+    </div>
+    <a href="/logout">Sair</a>
+</div>
+</body>
+</html>
+"""
+
+def limpar_ids():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("DELETE FROM enviados")
+    conn.commit()
+    conn.close()
+
+# Fim da parte 2.  
+# **Peça a PARTE 3 para eu continuar com toda a sequência Telethon (encaminhamento, simulação, forwarding, handlers, auto, etc).**
+# --- TELEGRAM HANDLERS (BOT E USER) ---
+
+async def encaminhar_videos_web():
+    global enviados, erros, enviando, contagem_hora, contagem_dia
+    if not source_channel or not dest_channel:
+        log("⚠️ Defina canal de origem e destino antes!")
+        return
+    try:
+        all_messages = await user_client.get_messages(source_channel, limit=None)
+    except Exception as e:
+        log(f"❌ Erro ao acessar o canal de origem: {e}")
+        save_erro(str(e), traceback.format_exc())
+        notificar_webhook(f"Erro ao acessar canal origem: {e}")
+        enviando = False
+        return
+    videos = [msg for msg in all_messages if is_real_video(msg)]
+    if not videos:
+        log("Nenhum vídeo encontrado no canal de origem.")
+        return
+    for i in range(0, len(videos), 10):
+        if not enviando:
+            log("Encaminhamento parado pelo usuário.")
+            break
+        reset_contadores()
+        if contagem_hora >= limite_hora or contagem_dia >= limite_dia:
+            log("⏳ Limite de encaminhamento atingido. Aguardando 1h...")
+            await asyncio.sleep(3600)
+            reset_contadores()
+        lote = videos[i:i+10]
+        for msg in lote:
+            if ja_foi_enviado(msg.id):
+                continue
+            if simulacao:
+                log(f"[SIMULAÇÃO] Encaminharia: {msg.id} - {getattr(msg, 'text', '')[:40]}")
+                continue
+            try:
+                await user_client.forward_messages(dest_channel, msg, silent=True)  # Envio stealth
+                marcar_como_enviado(msg.id)
+                enviados += 1
+                contagem_hora += 1
+                contagem_dia += 1
+                log(f"✅ Forwarded: {msg.id}")
+                await asyncio.sleep(random.randint(2, 4))
+            except Exception as e:
+                erros += 1
+                log(f"❌ Erro no {msg.id}: {e}")
+                save_erro(str(e), traceback.format_exc())
+                notificar_webhook(f"Erro grave no encaminhamento: {e}")
+                socketio.emit("erro", {"msg": str(e)}, broadcast=True)
+                if "Too Many Requests" in str(e) or "Flood" in str(e):
+                    log("⏳ Flood control ativado, aguardando 60s...")
+                    await asyncio.sleep(60)
+        espera = random.randint(20, 30)
+        log(f"Lote {i//10+1} encaminhado. Aguardando {espera}s...")
+        await asyncio.sleep(espera)
+    log(f"✅ Finalizado. Total encaminhados: {enviados} | Erros: {erros}")
+
+def ja_foi_enviado(message_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT 1 FROM enviados WHERE message_id = ?", (message_id,))
+    result = cursor.fetchone()
+    conn.close()
+    return result is not None
+
+def marcar_como_enviado(message_id):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("INSERT OR IGNORE INTO enviados (message_id) VALUES (?)", (message_id,))
+    conn.commit()
+    conn.close()
+
+async def exportar_ids(event=None):
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute("SELECT message_id FROM enviados")
+    ids = cursor.fetchall()
+    conn.close()
+    filename = "ids_enviados.txt"
+    with open(filename, "w") as f:
+        for id_tuple in ids:
+            f.write(f"{id_tuple[0]}\n")
+    if event:
+        await event.respond("Exportação concluída:", file=filename)
+    else:
+        log("Exportação concluída.")
+
+async def enviar_relatorio(event=None):
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM enviados")
+        enviados_db = cursor.fetchone()[0]
+        conn.close()
+    except Exception:
+        enviados_db = "??"
+    erros_log = 0
+    if os.path.exists(LOG_FILE):
+        with open(LOG_FILE) as f:
+            erros_log = sum(1 for l in f if "❌" in l)
+    texto = (
+        f"📈 *Relatório do Bot*\n"
+        f"Origem: `{source_channel}`\n"
+        f"Destino: `{dest_channel}`\n"
+        f"Enviados (DB): {enviados_db}\n"
+        f"Erros (Log): {erros_log}\n"
+        f"Auto-Encaminhar: {'ATIVO' if auto_mode else 'DESATIVADO'}\n"
+        f"Pausado: {'SIM' if auto_paused else 'NÃO'}\n"
+        f"Seu bot tá online e pronto 🚀"
+    )
+    if event:
+        await event.respond(texto, parse_mode="markdown")
+    else:
+        log(texto)
+
+async def buscar_video_nome(event, termo):
+    if not source_channel:
+        await event.respond("⚠️ Defina o canal de origem antes!")
+        return
+    await event.respond(f"🔍 Buscando vídeo(s) com: `{termo}` ...")
+    messages = await user_client.get_messages(source_channel, limit=500)
+    results = [msg for msg in messages if is_real_video(msg) and msg.text and termo.lower() in msg.text.lower()]
+    if not results:
+        await event.respond("Nenhum vídeo encontrado com esse termo.")
+    else:
+        txt = "\n".join(f"- ID: {msg.id} | Texto: {msg.text[:30]}" for msg in results[:10])
+        await event.respond(f"Encontrei {len(results)} vídeo(s):\n{txt}\n\nDeseja encaminhar algum? Envie o ID.")
+
+async def encaminhar_por_id(event, id_str):
+    if not source_channel or not dest_channel:
+        await event.respond("Defina o canal de origem e destino antes!")
+        return
+    try:
+        msg = await user_client.get_messages(source_channel, ids=int(id_str))
+        if not is_real_video(msg):
+            await event.respond("Esse ID não corresponde a um vídeo válido.")
+            return
+        if simulacao:
+            await event.respond(f"[SIMULAÇÃO] Encaminharia o vídeo ID {msg.id}")
+            return
+        await user_client.forward_messages(dest_channel, msg, silent=True)
+        marcar_como_enviado(msg.id)
+        await event.respond("Vídeo encaminhado com sucesso!")
+    except Exception as e:
+        await event.respond(f"Erro ao encaminhar: {e}")
+        save_erro(str(e), traceback.format_exc())
+        notificar_webhook(f"Erro ao encaminhar por ID: {e}")
+
+# --- HANDLERS DO BOT (TELEGRAM) ---
+@bot.on(events.NewMessage(pattern='/start'))
+async def start_menu(event):
+    if event.sender_id not in admin_user_ids:
+        await event.respond("Acesso negado.")
+        return
+    status = (
+        f"Menu de Controle:\n"
+        f"Origem: {source_channel or '❌ Não definido'}\n"
+        f"Destino: {dest_channel or '❌ Não definido'}\n"
+        f"Auto-Encaminhar: {'ATIVO' if auto_mode else 'DESATIVADO'}\n"
+        f"Pausado: {'SIM' if auto_paused else 'NÃO'}\n"
+        f"Enviados: {enviados} | Erros: {erros}\n"
+        f"Simulação: {'ATIVA' if simulacao else 'NÃO'}"
+    )
+    buttons = [
+        [Button.inline("▶️ Iniciar Manual", b"start_forward"), Button.inline("⏹️ Parar Manual", b"stop_forward")],
+        [Button.inline("🔄 Auto-Encaminhar", b"auto_on"), Button.inline("⏹️ Parar Auto", b"auto_off")],
+        [Button.inline("⏸️ Pausar Auto", b"pause_auto"), Button.inline("▶️ Retomar Auto", b"resume_auto")],
+        [Button.inline("🧪 Simulação ON", b"sim_on"), Button.inline("🧪 Simulação OFF", b"sim_off")],
+        [Button.inline("🔍 Buscar por Nome", b"search_name"), Button.inline("🗑️ Limpar IDs", b"clear_ids")],
+        [Button.inline("📈 Relatório", b"relatorio"), Button.inline("📁 Exportar IDs", b"export")],
+        [Button.inline("🔗 Definir Origem", b"set_origem"), Button.inline("🔗 Definir Destino", b"set_destino")],
+        [Button.inline("📊 Status", b"status")],
+    ]
+    await event.respond(status, buttons=buttons)
+
+@bot.on(events.CallbackQuery)
+async def callbacks(event):
+    global enviando, enviados, erros, auto_mode, auto_paused, waiting_for_channel, waiting_for_search, simulacao
+    if event.sender_id not in admin_user_ids:
+        await event.answer("Acesso não autorizado.", alert=True)
+        return
+    data = event.data.decode('utf-8')
+
+    if data == "start_forward":
+        if enviando:
+            await event.answer("Já está enviando.", alert=True)
+            return
+        if not source_channel or not dest_channel:
+            await event.answer("Defina origem e destino primeiro!", alert=True)
+            return
+        simulacao = False
+        enviando = True
+        enviados = 0
+        erros = 0
+        await event.answer("Iniciando manual...", alert=True)
+        asyncio.create_task(encaminhar_videos_web())
+    elif data == "stop_forward":
+        enviando = False
+        await event.answer("Encaminhamento manual será parado.", alert=True)
+    elif data == "auto_on":
+        if not source_channel or not dest_channel:
+            await event.answer("Defina origem e destino primeiro!", alert=True)
+            return
+        auto_mode = True
+        auto_paused = False
+        await event.answer("Auto-encaminhamento ativado!", alert=True)
+        await event.respond("🔄 O bot agora encaminhará automaticamente todo novo vídeo do canal de origem.")
+    elif data == "auto_off":
+        auto_mode = False
+        await event.answer("Auto-encaminhamento desativado!", alert=True)
+        await event.respond("⏹️ Auto-encaminhamento parado.")
+    elif data == "pause_auto":
+        if not auto_mode:
+            await event.answer("Auto-encaminhar já está desativado.", alert=True)
+        else:
+            auto_paused = True
+            await event.answer("Auto-encaminhamento PAUSADO.", alert=True)
+    elif data == "resume_auto":
+        if not auto_mode:
+            await event.answer("Ative o auto-encaminhar antes.", alert=True)
+        else:
+            auto_paused = False
+            await event.answer("Auto-encaminhamento RETOMADO.", alert=True)
+    elif data == "sim_on":
+        simulacao = True
+        await event.answer("Modo simulação ATIVADO!", alert=True)
+    elif data == "sim_off":
+        simulacao = False
+        await event.answer("Modo simulação DESATIVADO!", alert=True)
+    elif data == "search_name":
+        waiting_for_search = True
+        await event.respond("Envie a palavra ou trecho para buscar no nome/texto do vídeo:")
+    elif data == "clear_ids":
+        limpar_ids()
+        await event.answer("IDs limpos!", alert=True)
+        await event.respond("🗑️ IDs do banco foram limpos, pode encaminhar todos de novo.")
+    elif data == "relatorio":
+        await enviar_relatorio(event)
+        await event.answer("Relatório enviado!", alert=True)
+    elif data == "set_origem":
+        waiting_for_channel = 'origem'
+        await event.respond("Envie agora o @usuario ou link do CANAL **DE ORIGEM**:")
+    elif data == "set_destino":
+        waiting_for_channel = 'destino'
+        await event.respond("Envie agora o @usuario ou link do CANAL **DE DESTINO**:")
+    elif data == "status":
+        await start_menu(event)
+        await event.answer("Status atualizado!", alert=True)
+    elif data == "export":
+        await exportar_ids(event)
+        await event.answer("IDs exportados!", alert=True)
+
+@bot.on(events.NewMessage)
+async def on_text_commands(event):
+    global waiting_for_channel, waiting_for_search
+    if event.sender_id not in admin_user_ids:
+        return
+    if waiting_for_channel:
+        channel_username = sanitize_channel(event.text)
+        if waiting_for_channel == "origem":
+            set_source_channel(channel_username)
+            await event.respond(f"Canal de ORIGEM definido: {source_channel}")
+        elif waiting_for_channel == "destino":
+            set_dest_channel(channel_username)
+            await event.respond(f"Canal de DESTINO definido: {dest_channel}")
+        waiting_for_channel = None
+        return
+    if waiting_for_search:
+        termo = event.text.strip()
+        waiting_for_search = False
+        await buscar_video_nome(event, termo)
+        return
+    if event.text.strip().isdigit() and source_channel and dest_channel:
+        await encaminhar_por_id(event, event.text.strip())
+
+# --- Auto-forward robusto ---
+@user_client.on(events.NewMessage)
+async def auto_forward_new_video(event):
+    global auto_mode, source_channel, dest_channel, auto_paused, contagem_hora, contagem_dia
+    if auto_mode and not auto_paused and source_channel and dest_channel:
+        try:
+            if is_source_channel(event) and is_real_video(event.message):
+                reset_contadores()
+                if contagem_hora >= limite_hora or contagem_dia >= limite_dia:
+                    log("⏳ Limite de encaminhamento atingido. Aguardando 1h...")
+                    await asyncio.sleep(3600)
+                    reset_contadores()
+                msg = event.message
+                if not ja_foi_enviado(msg.id):
+                    if simulacao:
+                        log(f"[SIMULAÇÃO][AUTO] Encaminharia: {msg.id} - {getattr(msg, 'text', '')[:40]}")
+                        return
+                    await user_client.forward_messages(dest_channel, msg, silent=True)
+                    marcar_como_enviado(msg.id)
+                    contagem_hora += 1
+                    contagem_dia += 1
+                    log(f"✅ [AUTO] Forwarded: {msg.id}")
+                    await bot.send_message(admin_user_ids[0], f"✅ [AUTO] Vídeo novo encaminhado: {msg.id}")
+                    await asyncio.sleep(random.randint(2, 5))
+        except Exception as e:
+            log(f"❌ [AUTO] Erro auto-forward: {e}")
+            save_erro(str(e), traceback.format_exc())
+            await bot.send_message(admin_user_ids[0], f"❌ [AUTO] Erro ao encaminhar vídeo novo: {e}")
+            socketio.emit("erro", {"msg": str(e)}, broadcast=True)
+            if "Too Many Requests" in str(e) or "Flood" in str(e):
+                await bot.send_message(admin_user_ids[0], "⏳ Flood control ativado, aguardando 60s...")
+                await asyncio.sleep(60)
+
+# --- AGENDAMENTO ---
+async def agendamento_loop():
+    global agendamento, enviando
+    while True:
+        await asyncio.sleep(10)
+        if agendamento and datetime.now() >= agendamento:
+            log(f"⏰ Agendamento disparado para {agendamento}")
+            enviando = True
+            asyncio.create_task(encaminhar_videos_web())
+            agendamento = None
+
+# Fim da parte 3.
+# Peça a PARTE 4 para finalizar (main, inicialização, etc)!
+# --- MAIN E INICIALIZAÇÃO ---
+
+init_db()
+
+async def main():
+    await user_client.connect()
+    if not await user_client.is_user_authorized():
+        print("Faça login na sua conta pessoal:")
+        phone = input("Digite seu telefone: ")
+        await user_client.send_code_request(phone=phone)
+        await user_client.sign_in(phone=phone, code=input("Digite o código recebido: "))
+    await bot.start(bot_token=bot_token)
+    print("Bot e usuário prontos!")
+    # Inicia o loop de agendamento automático
+    asyncio.create_task(agendamento_loop())
+    # Inicia o painel web em thread separada
+    import threading
+    def run_painel():
+        socketio.run(app, host="0.0.0.0", port=5000)
+    threading.Thread(target=run_painel, daemon=True).start()
+    await bot.run_until_disconnected()
+
+if __name__ == "__main__":
+    try:
+        loop.run_until_complete(main())
+    except Exception as e:
+        log(f"Erro global: {e}")
+        save_erro(str(e), traceback.format_exc())
+        notificar_webhook(f"Erro global fatal: {traceback.format_exc()}")
